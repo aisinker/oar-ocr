@@ -74,8 +74,7 @@ impl OrtInfer {
         for ep in eps {
             match ep {
                 EP::CPU => {
-                    providers
-                        .push(ort::execution_providers::CPUExecutionProvider::default().build());
+                    providers.push(ort::ep::CPUExecutionProvider::default().build());
                 }
                 #[cfg(feature = "cuda")]
                 EP::CUDA {
@@ -85,11 +84,8 @@ impl OrtInfer {
                     cudnn_conv_algo_search,
                     cudnn_conv_use_max_workspace,
                 } => {
-                    use ort::execution_providers::{
-                        ArenaExtendStrategy, cuda::CuDNNConvAlgorithmSearch,
-                    };
-                    let mut cuda_provider =
-                        ort::execution_providers::CUDAExecutionProvider::default();
+                    use ort::ep::{ArenaExtendStrategy, cuda::ConvAlgorithmSearch};
+                    let mut cuda_provider = ort::ep::CUDAExecutionProvider::default();
                     if let Some(id) = device_id {
                         cuda_provider = cuda_provider.with_device_id(*id);
                     }
@@ -107,9 +103,9 @@ impl OrtInfer {
                     }
                     if let Some(search) = cudnn_conv_algo_search {
                         let search = match search.to_lowercase().as_str() {
-                            "heuristic" => CuDNNConvAlgorithmSearch::Heuristic,
-                            "default" => CuDNNConvAlgorithmSearch::Default,
-                            _ => CuDNNConvAlgorithmSearch::Exhaustive,
+                            "heuristic" => ConvAlgorithmSearch::Heuristic,
+                            "default" => ConvAlgorithmSearch::Default,
+                            _ => ConvAlgorithmSearch::Exhaustive,
                         };
                         cuda_provider = cuda_provider.with_conv_algorithm_search(search);
                     }
@@ -125,8 +121,7 @@ impl OrtInfer {
                     min_subgraph_size,
                     fp16_enable,
                 } => {
-                    let mut trt_provider =
-                        ort::execution_providers::TensorRTExecutionProvider::default();
+                    let mut trt_provider = ort::ep::TensorRTExecutionProvider::default();
                     if let Some(id) = device_id {
                         trt_provider = trt_provider.with_device_id(*id);
                     }
@@ -143,8 +138,7 @@ impl OrtInfer {
                 }
                 #[cfg(feature = "directml")]
                 EP::DirectML { device_id } => {
-                    let mut dml_provider =
-                        ort::execution_providers::DirectMLExecutionProvider::default();
+                    let mut dml_provider = ort::ep::DirectMLExecutionProvider::default();
                     if let Some(id) = device_id {
                         dml_provider = dml_provider.with_device_id(*id);
                     }
@@ -155,12 +149,11 @@ impl OrtInfer {
                     ane_only,
                     subgraphs,
                 } => {
-                    use ort::execution_providers::coreml::CoreMLComputeUnits;
-                    let mut coreml_provider =
-                        ort::execution_providers::CoreMLExecutionProvider::default();
+                    use ort::ep::coreml::ComputeUnits;
+                    let mut coreml_provider = ort::ep::CoreMLExecutionProvider::default();
                     if let Some(true) = ane_only {
-                        coreml_provider = coreml_provider
-                            .with_compute_units(CoreMLComputeUnits::CPUAndNeuralEngine);
+                        coreml_provider =
+                            coreml_provider.with_compute_units(ComputeUnits::CPUAndNeuralEngine);
                     }
                     if let Some(sub) = subgraphs {
                         coreml_provider = coreml_provider.with_subgraphs(*sub);
@@ -169,16 +162,14 @@ impl OrtInfer {
                 }
                 #[cfg(feature = "webgpu")]
                 EP::WebGPU => {
-                    providers
-                        .push(ort::execution_providers::WebGPUExecutionProvider::default().build());
+                    providers.push(ort::ep::WebGPUExecutionProvider::default().build());
                 }
                 #[cfg(feature = "openvino")]
                 EP::OpenVINO {
                     device_type,
                     num_threads,
                 } => {
-                    let mut openvino_provider =
-                        ort::execution_providers::OpenVINOExecutionProvider::default();
+                    let mut openvino_provider = ort::ep::OpenVINOExecutionProvider::default();
                     if let Some(device) = device_type {
                         openvino_provider = openvino_provider.with_device_type(device.clone());
                     }
