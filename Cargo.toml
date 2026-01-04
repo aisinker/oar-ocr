@@ -33,7 +33,7 @@ openvino = ["ort/openvino"]
 # Auto-download ONNX Runtime binaries during build (enabled by default).
 # Set ORT_LIB_LOCATION to use a custom installation (skips download).
 # Use --no-default-features for offline/enterprise environments.
-download-binaries = ["ort/download-binaries"]
+download-binaries = ["ort/download-binaries", "ort/tls-rustls"]
 
 [dependencies]
 oar-ocr-derive = { path = "oar-ocr-derive" }
@@ -45,8 +45,8 @@ regex = "1.11.1"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 toml = "0.9"
-ort = { version = "2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "tracing", "copy-dylibs"] }
-ndarray = "0.16"
+ort = { git = "https://github.com/pykeio/ort.git", branch = "main", default-features = false, features = ["std", "ndarray", "tracing", "copy-dylibs"] }
+ndarray = "0.17"
 nalgebra = "0.34"
 rayon = "1.8"
 thiserror = "2.0"

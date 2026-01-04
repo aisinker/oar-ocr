@@ -13,8 +13,8 @@ impl OrtInfer {
                 .map_err(|_| OCRError::InvalidInput {
                     message: "Failed to acquire session lock".to_string(),
                 })?;
-            if let Some(output) = session.outputs.first() {
-                Ok(output.name.clone())
+            if let Some(output) = session.outputs().first() {
+                Ok(output.name().to_string())
             } else {
                 Err(OCRError::InvalidInput {
                     message: "No outputs available in session - model may be invalid or corrupted"
@@ -52,7 +52,7 @@ impl OrtInfer {
         &self,
         x: &Tensor4D,
         processor: impl for<'a> FnOnce(
-            &'a ort::session::SessionOutputs<'a>,
+            ort::session::SessionOutputs<'a>,
             &str,
             &[String],
             &[usize],
@@ -100,9 +100,9 @@ impl OrtInfer {
 
         // Collect declared output names before running (avoid borrow conflicts later)
         let output_names: Vec<String> = session_guard
-            .outputs
+            .outputs()
             .iter()
-            .map(|o| o.name.clone())
+            .map(|o| o.name().to_string())
             .collect();
 
         let outputs = session_guard.run(inputs).map_err(|e| {
@@ -110,12 +110,12 @@ impl OrtInfer {
                 .input_shape(&input_shape)
                 .context(format!(
                     "ONNX Runtime inference failed with input '{}' -> output '{}'",
-                    self.input_name, output_name
+                    self.input_name, &output_name
                 ))
                 .build(e)
         })?;
 
-        processor(&outputs, &output_name, &output_names, &input_shape)
+        processor(outputs, &output_name, &output_names, &input_shape)
     }
 
     /// Runs inference with f32 output extraction.
@@ -491,9 +491,9 @@ impl OrtInfer {
 
         // Check which inputs the model expects
         let has_im_shape = session_guard
-            .inputs
+            .inputs()
             .iter()
-            .any(|input| input.name == "im_shape");
+            .any(|input| input.name() == "im_shape");
 
         // Build inputs based on what's provided and what the model expects
         let outputs = match (im_shape.as_ref(), scale_factor.as_ref(), has_im_shape) {
