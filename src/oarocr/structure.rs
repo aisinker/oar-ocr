@@ -4,7 +4,7 @@
 //! analysis pipelines that can detect layout elements, recognize tables, extract formulas,
 //! and optionally integrate OCR for text extraction.
 
-use super::builder_utils::build_optional_adapter;
+use super::builder_utils::{build_optional_adapter, resolve_model_path};
 use oar_ocr_core::core::OCRError;
 use oar_ocr_core::core::config::OrtSessionConfig;
 use oar_ocr_core::core::traits::OrtConfigurable;
@@ -28,6 +28,7 @@ use oar_ocr_core::domain::tasks::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// IoU threshold for removing overlapping layout elements (0.5 = 50% overlap).
 const LAYOUT_OVERLAP_IOU_THRESHOLD: f32 = 0.5;
@@ -158,6 +159,7 @@ pub struct OARStructureBuilder {
     formula_recognition_model: Option<PathBuf>,
     formula_recognition_type: Option<String>, // "pp_formulanet" or "unimernet"
     formula_tokenizer_path: Option<PathBuf>,
+    formula_ort_session_config: Option<OrtSessionConfig>,
 
     // Optional seal text detection
     seal_text_detection_model: Option<PathBuf>,
@@ -224,6 +226,7 @@ impl OARStructureBuilder {
             formula_recognition_model: None,
             formula_recognition_type: None,
             formula_tokenizer_path: None,
+            formula_ort_session_config: None,
             seal_text_detection_model: None,
             text_detection_model: None,
             text_line_orientation_model: None,
@@ -588,6 +591,12 @@ impl OARStructureBuilder {
         self
     }
 
+    /// Sets an ONNX Runtime session configuration only for formula recognition.
+    pub fn formula_ort_session(mut self, config: OrtSessionConfig) -> Self {
+        self.formula_ort_session_config = Some(config);
+        self
+    }
+
     /// Integrates OCR into the pipeline for text extraction.
     ///
     /// # Arguments
@@ -637,7 +646,37 @@ impl OARStructureBuilder {
     /// Builds the structure analyzer runtime.
     ///
     /// This method instantiates all adapters and returns a ready-to-use structure analyzer.
-    pub fn build(self) -> Result<OARStructure, OCRError> {
+    pub fn build(mut self) -> Result<OARStructure, OCRError> {
+        // Resolve every model/dict/tokenizer path through the auto-download
+        // cache when the `auto-download` feature is enabled. With the feature
+        // off these calls are infallible no-ops.
+        self.layout_detection_model = resolve_model_path(&self.layout_detection_model)?;
+        fn resolve_opt_path(p: &mut Option<PathBuf>) -> Result<(), OCRError> {
+            if let Some(path) = p {
+                *path = resolve_model_path(path)?;
+            }
+            Ok(())
+        }
+        resolve_opt_path(&mut self.document_orientation_model)?;
+        resolve_opt_path(&mut self.document_rectification_model)?;
+        resolve_opt_path(&mut self.region_detection_model)?;
+        resolve_opt_path(&mut self.table_classification_model)?;
+        resolve_opt_path(&mut self.table_orientation_model)?;
+        resolve_opt_path(&mut self.table_cell_detection_model)?;
+        resolve_opt_path(&mut self.table_structure_recognition_model)?;
+        resolve_opt_path(&mut self.table_structure_dict_path)?;
+        resolve_opt_path(&mut self.wired_table_structure_model)?;
+        resolve_opt_path(&mut self.wireless_table_structure_model)?;
+        resolve_opt_path(&mut self.wired_table_cell_model)?;
+        resolve_opt_path(&mut self.wireless_table_cell_model)?;
+        resolve_opt_path(&mut self.formula_recognition_model)?;
+        resolve_opt_path(&mut self.formula_tokenizer_path)?;
+        resolve_opt_path(&mut self.seal_text_detection_model)?;
+        resolve_opt_path(&mut self.text_detection_model)?;
+        resolve_opt_path(&mut self.text_line_orientation_model)?;
+        resolve_opt_path(&mut self.text_recognition_model)?;
+        resolve_opt_path(&mut self.character_dict_path)?;
+
         // Load character dictionary if OCR is enabled
         let char_dict = if let Some(ref dict_path) = self.character_dict_path {
             Some(
@@ -991,7 +1030,11 @@ impl OARStructureBuilder {
                         builder = builder.task_config(config.clone());
                     }
 
-                    if let Some(ref ort_config) = self.ort_session_config {
+                    if let Some(ort_config) = self
+                        .formula_ort_session_config
+                        .as_ref()
+                        .or(self.ort_session_config.as_ref())
+                    {
                         builder = builder.with_ort_config(ort_config.clone());
                     }
 
@@ -1008,7 +1051,11 @@ impl OARStructureBuilder {
                         builder = builder.task_config(config.clone());
                     }
 
-                    if let Some(ref ort_config) = self.ort_session_config {
+                    if let Some(ort_config) = self
+                        .formula_ort_session_config
+                        .as_ref()
+                        .or(self.ort_session_config.as_ref())
+                    {
                         builder = builder.with_ort_config(ort_config.clone());
                     }
 
@@ -1049,6 +1096,7 @@ impl OARStructureBuilder {
         // PP-StructureV3 overall OCR uses DB preprocess with:
         // - limit_side_len=736
         // - limit_type="min"
+        // - max_side_limit=4000
         // We fill these defaults here (only for the structure pipeline) unless the caller
         // explicitly overrides them via `text_detection_config`.
         let text_detection_adapter = if let Some(ref model_path) = self.text_detection_model {
@@ -1057,11 +1105,28 @@ impl OARStructureBuilder {
             // Note: image_batch_size batching not yet implemented for structure analysis
 
             let mut effective_cfg = self.text_detection_config.clone().unwrap_or_default();
+
+            // Table-heavy documents are sensitive to detection fragmentation.
+            // Match PaddleX's lower table-scene threshold when users don't override config.
+            let has_table_pipeline = self.table_classification_model.is_some()
+                || self.table_structure_recognition_model.is_some()
+                || self.wired_table_structure_model.is_some()
+                || self.wireless_table_structure_model.is_some()
+                || self.table_cell_detection_model.is_some()
+                || self.wired_table_cell_model.is_some()
+                || self.wireless_table_cell_model.is_some();
+            if self.text_detection_config.is_none() && has_table_pipeline {
+                effective_cfg.box_threshold = 0.4;
+            }
+
             if effective_cfg.limit_side_len.is_none() {
                 effective_cfg.limit_side_len = Some(736);
             }
             if effective_cfg.limit_type.is_none() {
                 effective_cfg.limit_type = Some(crate::processors::LimitType::Min);
+            }
+            if effective_cfg.max_side_len.is_none() {
+                effective_cfg.max_side_len = Some(4000);
             }
             builder = builder.with_config(effective_cfg);
 
@@ -1149,6 +1214,17 @@ impl OARStructureBuilder {
 #[derive(Debug)]
 pub struct OARStructure {
     pipeline: StructurePipeline,
+}
+
+/// Intermediate result from preprocessing and layout detection for a single page.
+/// Produced by `OARStructure::prepare_page` and consumed by `complete_page`.
+struct PreparedPage {
+    current_image: std::sync::Arc<image::RgbImage>,
+    orientation_angle: Option<f32>,
+    rectified_img: Option<std::sync::Arc<image::RgbImage>>,
+    rotation: Option<crate::oarocr::preprocess::OrientationCorrection>,
+    layout_elements: Vec<crate::domain::structure::LayoutElement>,
+    detected_region_blocks: Option<Vec<crate::domain::structure::RegionBlock>>,
 }
 
 impl OARStructure {
@@ -1283,7 +1359,7 @@ impl OARStructure {
 
             for ((crop_box, is_first), (text, score)) in crop_boxes
                 .into_iter()
-                .zip(rec_texts.into_iter().zip(rec_scores.into_iter()))
+                .zip(rec_texts.into_iter().zip(rec_scores))
             {
                 if text.is_empty() {
                     continue;
@@ -1303,6 +1379,7 @@ impl OARStructure {
                         confidence: Some(score),
                         orientation_angle: None,
                         word_boxes: None,
+                        label: None,
                     });
                 }
             }
@@ -1364,6 +1441,7 @@ impl OARStructure {
                         confidence: Some(*score),
                         orientation_angle: None,
                         word_boxes: None,
+                        label: None,
                     });
                 }
             }
@@ -1601,6 +1679,7 @@ impl OARStructure {
                         confidence: Some(*score),
                         orientation_angle: None,
                         word_boxes: None,
+                        label: None,
                     });
                 }
             }
@@ -1624,10 +1703,12 @@ impl OARStructure {
         use oar_ocr_core::domain::structure::{LayoutElement, LayoutElementType, RegionBlock};
 
         let input = ImageTaskInput::new(vec![page_image.clone()]);
+        let t_layout = Instant::now();
         let layout_result = self
             .pipeline
             .layout_detection_adapter
             .execute(input, None)?;
+        let layout_dur = t_layout.elapsed();
 
         let mut layout_elements: Vec<LayoutElement> = Vec::new();
         if let Some(elements) = layout_result.elements.first() {
@@ -1643,6 +1724,7 @@ impl OARStructure {
         let mut detected_region_blocks: Option<Vec<RegionBlock>> = None;
         if let Some(ref region_adapter) = self.pipeline.region_detection_adapter {
             let region_input = ImageTaskInput::new(vec![page_image.clone()]);
+            let t_region = Instant::now();
             if let Ok(region_result) = region_adapter.execute(region_input, None)
                 && let Some(region_elements) = region_result.elements.first()
                 && !region_elements.is_empty()
@@ -1658,6 +1740,11 @@ impl OARStructure {
                     .collect();
                 detected_region_blocks = Some(blocks);
             }
+            tracing::debug!(
+                "structure stage: region detection {:.1} ms, blocks={}",
+                t_region.elapsed().as_secs_f64() * 1000.0,
+                detected_region_blocks.as_ref().map_or(0, Vec::len)
+            );
         }
 
         if layout_elements.len() > 1 {
@@ -1675,6 +1762,11 @@ impl OARStructure {
         }
 
         crate::domain::structure::apply_standardized_layout_label_fixes(&mut layout_elements);
+        tracing::debug!(
+            "structure stage: layout detection {:.1} ms, elements={}",
+            layout_dur.as_secs_f64() * 1000.0,
+            layout_elements.len()
+        );
 
         Ok((layout_elements, detected_region_blocks))
     }
@@ -1727,15 +1819,32 @@ impl OARStructure {
             return Ok(Vec::new());
         }
 
-        let input = ImageTaskInput::new(crops);
-        let formula_result = formula_adapter.execute(input, None)?;
+        let t_formula = Instant::now();
+        let batch_size = formula_adapter.recommended_batch_size().max(1);
+        let crop_count = bboxes.len();
+        let mut formula_results = Vec::with_capacity(crop_count);
+        let mut score_results = Vec::with_capacity(crop_count);
+        let mut remaining_crops = crops;
+        while !remaining_crops.is_empty() {
+            let chunk_len = batch_size.min(remaining_crops.len());
+            let rest = remaining_crops.split_off(chunk_len);
+            let chunk_vec = remaining_crops;
+            remaining_crops = rest;
+
+            let output = formula_adapter.execute(ImageTaskInput::new(chunk_vec), None)?;
+            formula_results.extend(output.formulas);
+            score_results.extend(output.scores);
+        }
+        tracing::debug!(
+            "structure stage: formula recognition {:.1} ms, crops={}, batches={}, batch_size={}",
+            t_formula.elapsed().as_secs_f64() * 1000.0,
+            crop_count,
+            crop_count.div_ceil(batch_size),
+            batch_size
+        );
 
         let mut formulas = Vec::new();
-        for ((bbox, formula), score) in bboxes
-            .into_iter()
-            .zip(formula_result.formulas.into_iter())
-            .zip(formula_result.scores.into_iter())
-        {
+        for ((bbox, formula), score) in bboxes.into_iter().zip(formula_results).zip(score_results) {
             let width = bbox.x_max() - bbox.x_min();
             let height = bbox.y_max() - bbox.y_min();
             if width <= 0.0 || height <= 0.0 {
@@ -1804,7 +1913,7 @@ impl OARStructure {
         let input = ImageTaskInput::new(seal_crops);
         let seal_result = seal_adapter.execute(input, None)?;
 
-        for ((dx, dy), detections) in crop_offsets.iter().zip(seal_result.detections.into_iter()) {
+        for ((dx, dy), detections) in crop_offsets.iter().zip(seal_result.detections) {
             for detection in detections {
                 let translated_bbox = crate::processors::BoundingBox::new(
                     detection
@@ -1830,7 +1939,7 @@ impl OARStructure {
         page_width: f32,
         page_height: f32,
     ) {
-        use oar_ocr_core::processors::layout_sorting::sort_layout_enhanced;
+        use oar_ocr_core::processors::layout_sorting::{SortableElement, sort_layout_enhanced};
 
         if layout_elements.is_empty() {
             return;
@@ -1838,7 +1947,11 @@ impl OARStructure {
 
         let sortable_elements: Vec<_> = layout_elements
             .iter()
-            .map(|e| (e.bbox.clone(), e.element_type))
+            .map(|e| SortableElement {
+                bbox: e.bbox.clone(),
+                element_type: e.element_type,
+                num_lines: e.num_lines,
+            })
             .collect();
 
         let sorted_indices = sort_layout_enhanced(&sortable_elements, page_width, page_height);
@@ -1947,7 +2060,9 @@ impl OARStructure {
 
         // Text detection (on masked image).
         let input = ImageTaskInput::new(vec![ocr_image.clone()]);
+        let t_text_det = Instant::now();
         let det_result = text_detection_adapter.execute(input, None)?;
+        let text_det_dur = t_text_det.elapsed();
 
         let mut detection_boxes = if let Some(detections) = det_result.detections.first() {
             detections
@@ -2128,6 +2243,8 @@ impl OARStructure {
                 let batch_size = self.pipeline.region_batch_size.unwrap_or(8).max(1);
                 let mut recognized_by_det_idx: Vec<Option<(String, f32)>> =
                     vec![None; detection_boxes.len()];
+                let mut rec_batches = 0usize;
+                let t_text_rec = Instant::now();
 
                 while !items.is_empty() {
                     let take_n = batch_size.min(items.len());
@@ -2142,11 +2259,12 @@ impl OARStructure {
                     }
 
                     let rec_input = ImageTaskInput::new(rec_imgs);
+                    rec_batches += 1;
                     if let Ok(rec_result) = text_recognition_adapter.execute(rec_input, None) {
                         for ((det_idx, text), score) in det_indices
                             .into_iter()
-                            .zip(rec_result.texts.into_iter())
-                            .zip(rec_result.scores.into_iter())
+                            .zip(rec_result.texts)
+                            .zip(rec_result.scores)
                         {
                             if text.is_empty() {
                                 continue;
@@ -2157,6 +2275,13 @@ impl OARStructure {
                         }
                     }
                 }
+                tracing::debug!(
+                    "structure stage: text recognition {:.1} ms, crops={}, batches={}, batch_size={}",
+                    t_text_rec.elapsed().as_secs_f64() * 1000.0,
+                    detection_boxes.len(),
+                    rec_batches,
+                    batch_size
+                );
 
                 // Emit OCR regions in original detection order, matching PaddleX.
                 for (det_idx, rec) in recognized_by_det_idx.into_iter().enumerate() {
@@ -2172,6 +2297,7 @@ impl OARStructure {
                         confidence: Some(score),
                         orientation_angle: None,
                         word_boxes: None,
+                        label: None,
                     });
                 }
             }
@@ -2186,6 +2312,12 @@ impl OARStructure {
             text_recognition_adapter,
             batch_size,
         )?;
+        tracing::debug!(
+            "structure stage: text detection {:.1} ms, boxes={}, recognized_regions={}",
+            text_det_dur.as_secs_f64() * 1000.0,
+            detection_boxes.len(),
+            text_regions.len()
+        );
 
         Ok(text_regions)
     }
@@ -2216,19 +2348,9 @@ impl OARStructure {
         Ok(result)
     }
 
-    /// Analyzes the structure of a document image.
-    ///
-    /// This method is the core implementation for structure analysis and can be called
-    /// directly with an in-memory image.
-    ///
-    /// # Arguments
-    ///
-    /// * `image` - The input RGB image
-    ///
-    /// # Returns
-    ///
-    /// A `StructureResult` containing detected layout elements, tables, formulas, and text.
-    pub fn predict_image(&self, image: image::RgbImage) -> Result<StructureResult, OCRError> {
+    /// Preprocesses a page image and runs layout detection, returning intermediate
+    /// results ready for formula recognition and downstream processing.
+    fn prepare_page(&self, image: image::RgbImage) -> Result<PreparedPage, OCRError> {
         use crate::oarocr::preprocess::DocumentPreprocessor;
         use std::sync::Arc;
 
@@ -2242,11 +2364,38 @@ impl OARStructure {
         let rectified_img = preprocess.rectified_img;
         let rotation = preprocess.rotation;
 
-        let (mut layout_elements, mut detected_region_blocks) =
+        let (layout_elements, detected_region_blocks) =
             self.detect_layout_and_regions(&current_image)?;
 
+        Ok(PreparedPage {
+            current_image,
+            orientation_angle,
+            rectified_img,
+            rotation,
+            layout_elements,
+            detected_region_blocks,
+        })
+    }
+
+    /// Completes page analysis given a `PreparedPage` and pre-computed formula results.
+    /// Runs seal detection, OCR, table analysis, stitching, and coordinate transforms.
+    fn complete_page(
+        &self,
+        prepared: PreparedPage,
+        mut formulas: Vec<crate::domain::structure::FormulaResult>,
+    ) -> Result<StructureResult, OCRError> {
+        use std::sync::Arc;
+
+        let PreparedPage {
+            current_image,
+            orientation_angle,
+            rectified_img,
+            rotation,
+            mut layout_elements,
+            mut detected_region_blocks,
+        } = prepared;
+
         let mut tables = Vec::new();
-        let mut formulas = self.recognize_formulas(&current_image, &layout_elements)?;
 
         self.detect_seal_text(&current_image, &mut layout_elements)?;
 
@@ -2265,13 +2414,16 @@ impl OARStructure {
             Self::assign_region_block_membership(regions, &layout_elements);
         }
 
+        let t_ocr = Instant::now();
         let mut text_regions = self.run_overall_ocr(
             &current_image,
             &layout_elements,
             detected_region_blocks.as_deref(),
         )?;
+        let ocr_dur = t_ocr.elapsed();
 
         {
+            let t_tables = Instant::now();
             let analyzer = crate::oarocr::table_analyzer::TableAnalyzer::new(
                 crate::oarocr::table_analyzer::TableAnalyzerConfig {
                     table_classification_adapter: self
@@ -2313,7 +2465,17 @@ impl OARStructure {
                 &formulas,
                 &text_regions,
             )?);
+            tracing::debug!(
+                "structure stage: table analysis {:.1} ms, tables={}",
+                t_tables.elapsed().as_secs_f64() * 1000.0,
+                tables.len()
+            );
         }
+        tracing::debug!(
+            "structure stage: overall OCR total {:.1} ms, regions={}",
+            ocr_dur.as_secs_f64() * 1000.0,
+            text_regions.len()
+        );
 
         // 5b. Optional OCR box splitting by table cell boundaries.
         //
@@ -2322,9 +2484,7 @@ impl OARStructure {
         // - For each OCR box that overlaps >= k table cells, split at cell boundaries
         // - Re-run recognition on each split crop
         // - Replace the original OCR box with the split boxes + texts
-        let has_detection_backed_table_cells = tables
-            .iter()
-            .any(|table| table.cells.iter().any(|cell| cell.confidence < 0.999));
+        let has_detection_backed_table_cells = tables.iter().any(|table| !table.is_e2e);
         if has_detection_backed_table_cells
             && !text_regions.is_empty()
             && let Some(ref text_rec_adapter) = self.pipeline.text_recognition_adapter
@@ -2411,6 +2571,23 @@ impl OARStructure {
             }
         }
 
+        // PaddleX: convert_formula_res_to_ocr_format — inject formula results into
+        // the overall OCR pool so they participate in normal block matching and table
+        // cell matching. The raw LaTeX text is used here (no $...$ wrapping);
+        // wrapping is handled by to_markdown() for formula elements, by
+        // stitch_tables() for table cells, and by sort_and_join_texts for inline formulas.
+        for formula in &formulas {
+            let w = formula.bbox.x_max() - formula.bbox.x_min();
+            let h = formula.bbox.y_max() - formula.bbox.y_min();
+            if w > 1.0 && h > 1.0 {
+                let mut region = crate::oarocr::TextRegion::new(formula.bbox.clone());
+                region.text = Some(formula.latex.clone().into());
+                region.confidence = Some(1.0);
+                region.label = Some("formula".into()); // Mark as formula for inline wrapping
+                text_regions.push(region);
+            }
+        }
+
         // Construct and return result
         // Ensure rectified_img is always set for markdown image extraction
         // If no rectification was applied, use current_image
@@ -2439,6 +2616,129 @@ impl OARStructure {
         ResultStitcher::stitch_with_config(&mut result, &stitch_cfg);
 
         Ok(result)
+    }
+
+    /// Analyzes the structure of a single document image.
+    pub fn predict_image(&self, image: image::RgbImage) -> Result<StructureResult, OCRError> {
+        let t_total = Instant::now();
+        let prepared = self.prepare_page(image)?;
+        let formulas =
+            self.recognize_formulas(&prepared.current_image, &prepared.layout_elements)?;
+        let result = self.complete_page(prepared, formulas)?;
+        tracing::debug!(
+            "structure stage: total predict_image {:.1} ms",
+            t_total.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(result)
+    }
+
+    /// Analyzes multiple document page images with cross-page formula batching.
+    ///
+    /// All formula crops from every page are collected first and forwarded to the
+    /// formula adapter in a single `execute` call, reducing ONNX inference overhead
+    /// compared to calling [`Self::predict_image`] sequentially.  Layout detection and all
+    /// other per-page steps are still performed independently per page.
+    ///
+    /// Per-page errors are returned individually so that a failure on one page does
+    /// not abort the remaining pages.
+    pub fn predict_images(
+        &self,
+        images: Vec<image::RgbImage>,
+    ) -> Vec<Result<StructureResult, OCRError>> {
+        use oar_ocr_core::core::traits::task::ImageTaskInput;
+        use oar_ocr_core::domain::structure::FormulaResult;
+        use oar_ocr_core::utils::BBoxCrop;
+
+        if images.is_empty() {
+            return Vec::new();
+        }
+
+        // Phase 1: Preprocessing + layout detection for every page.
+        // Pages that fail preparation are recorded as Err and skipped in later phases.
+        let prepared_pages: Vec<Result<PreparedPage, OCRError>> = images
+            .into_iter()
+            .map(|image| self.prepare_page(image))
+            .collect();
+
+        // Phase 2: Batch formula recognition across all successfully prepared pages.
+        let num_pages = prepared_pages.len();
+        let mut per_page_formulas: Vec<Vec<FormulaResult>> =
+            (0..num_pages).map(|_| Vec::new()).collect();
+
+        if let Some(ref formula_adapter) = self.pipeline.formula_recognition_adapter {
+            let mut all_crops: Vec<image::RgbImage> = Vec::new();
+            let mut crop_meta: Vec<(usize, oar_ocr_core::processors::BoundingBox)> = Vec::new();
+
+            for (page_idx, prepared) in prepared_pages.iter().enumerate() {
+                let prepared = match prepared {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                for elem in prepared
+                    .layout_elements
+                    .iter()
+                    .filter(|e| e.element_type.is_formula())
+                {
+                    match BBoxCrop::crop_bounding_box(&prepared.current_image, &elem.bbox) {
+                        Ok(crop) => {
+                            all_crops.push(crop);
+                            crop_meta.push((page_idx, elem.bbox.clone()));
+                        }
+                        Err(err) => {
+                            tracing::warn!("Formula region crop failed (batch): {}", err);
+                        }
+                    }
+                }
+            }
+
+            if !all_crops.is_empty() {
+                let batch_size = formula_adapter.recommended_batch_size().max(1);
+                let mut remaining_crops = all_crops;
+                let mut meta_offset = 0;
+
+                while !remaining_crops.is_empty() {
+                    let chunk_len = batch_size.min(remaining_crops.len());
+                    let rest = remaining_crops.split_off(chunk_len);
+                    let chunk_vec = remaining_crops;
+                    remaining_crops = rest;
+
+                    let chunk_meta = &crop_meta[meta_offset..meta_offset + chunk_len];
+                    match formula_adapter.execute(ImageTaskInput::new(chunk_vec), None) {
+                        Ok(formula_output) => {
+                            for ((page_idx, bbox), (formula_text, score)) in
+                                chunk_meta.iter().cloned().zip(
+                                    formula_output
+                                        .formulas
+                                        .into_iter()
+                                        .zip(formula_output.scores),
+                                )
+                            {
+                                let width = bbox.x_max() - bbox.x_min();
+                                let height = bbox.y_max() - bbox.y_min();
+                                if width > 0.0 && height > 0.0 {
+                                    per_page_formulas[page_idx].push(FormulaResult {
+                                        bbox,
+                                        latex: formula_text,
+                                        confidence: score.unwrap_or(0.0),
+                                    });
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("Batch formula recognition failed: {}", err);
+                        }
+                    }
+                    meta_offset += chunk_len;
+                }
+            }
+        }
+
+        // Phase 3: Complete each page with its pre-computed formula results.
+        prepared_pages
+            .into_iter()
+            .zip(per_page_formulas)
+            .map(|(prepared, formulas)| self.complete_page(prepared?, formulas))
+            .collect()
     }
 }
 
